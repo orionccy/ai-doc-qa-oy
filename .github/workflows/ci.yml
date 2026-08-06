@@ -1,0 +1,34 @@
+# CI 流水线:每次 push / 提 PR 时,在云端自动执行质量检查
+# 坏代码进不了 main 分支 —— 这就是企业级的"质量门禁"
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      # 1) 拉取代码
+      - uses: actions/checkout@v4
+
+      # 2) 安装 Python 3.11
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 3) 安装依赖(纯测试只需轻量依赖,不调用真实 API)
+      - name: 安装依赖
+        run: |
+          pip install pytest
+          pip install -r requirements.txt
+
+      # 4) 语法编译检查:代码必须能被解释器编译
+      - name: 语法检查
+        run: python -m py_compile app/*.py
+
+      # 5) 运行单元测试:逻辑回归保护
+      - name: 运行测试
+        run: python -m pytest tests/ -v

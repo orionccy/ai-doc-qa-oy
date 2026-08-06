@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI 文档问答助手</title>
+  <!--
+    前端说明:
+    纯原生 HTML + JavaScript,没有框架,方便学习。
+    三个核心能力,对应三个 fetch 调用:
+      上传  -> POST /api/upload   (FormData 多文件)
+      聊天  -> POST /api/chat     (流式读取响应)
+      删除  -> DELETE /api/docs   (URL 参数传文档名)
+  -->
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f6f8; }
+    .app { max-width: 800px; margin: 0 auto; padding: 24px 16px; height: 100vh; display: flex; flex-direction: column; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    h1 { font-size: 22px; }
+    .sub { color: #888; font-size: 13px; margin-top: 4px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 14px; margin-bottom: 12px; }
+    .upload-row { display: flex; gap: 10px; align-items: center; }
+    input[type=file] { flex: 1; font-size: 14px; color: #555; }
+    button { border: none; border-radius: 8px; padding: 8px 16px; font-size: 14px; cursor: pointer; }
+    .btn-primary { background: #2563eb; color: #fff; }
+    .btn-primary:hover { background: #1d4ed8; }
+    .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-danger { background: none; color: #ef4444; font-size: 12px; padding: 2px 8px; }
+    .btn-danger:hover { background: #fef2f2; }
+    .msg { margin-top: 8px; font-size: 13px; }
+    .docs-title { font-size: 12px; color: #666; font-weight: 600; margin-bottom: 6px; }
+    .doc-item { display: flex; justify-content: space-between; align-items: center; font-size: 14px; padding: 2px 0; }
+    .doc-name { color: #333; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .doc-meta { color: #999; font-size: 12px; margin-left: 8px; }
+    .chat { flex: 1; overflow-y: auto; background: #fff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; }
+    .bubble { max-width: 85%; padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.7; margin-bottom: 12px; white-space: pre-wrap; word-break: break-word; }
+    .user { background: #2563eb; color: #fff; margin-left: auto; }
+    .assistant { background: #f3f4f6; color: #222; border: 1px solid #e5e7eb; }
+    .empty { text-align: center; color: #bbb; padding: 40px 0; font-size: 14px; }
+    .input-row { display: flex; gap: 10px; margin-top: 12px; }
+    .input-row input { flex: 1; border: 1px solid #d1d5db; border-radius: 10px; padding: 12px; font-size: 14px; outline: none; }
+    .input-row input:focus { border-color: #2563eb; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>📄 AI 文档问答助手</h1>
+        <div class="sub">Python 版 · FastAPI + LangChain · 对话 DeepSeek · 向量化阿里百炼</div>
+      </div>
+    </header>
+
+    <!-- 上传区 -->
+    <div class="card">
+      <div class="upload-row">
+        <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx" multiple />
+        <button class="btn-primary" id="uploadBtn" onclick="handleUpload()">上传入库</button>
+      </div>
+      <div class="msg" id="uploadMsg"></div>
+    </div>
+
+    <!-- 已入库文档列表 -->
+    <div class="card" id="docsCard" style="display:none">
+      <div class="docs-title">📚 已入库文档</div>
+      <div id="docsList"></div>
+    </div>
+
+    <!-- 聊天区 -->
+    <div class="chat" id="chatBox">
+      <div class="empty">先上传一个文档(txt / md / pdf / docx),然后向它提问 📝</div>
+    </div>
+
+    <!-- 输入区 -->
+    <form class="input-row" onsubmit="sendMessage(event)">
+      <input id="chatInput" placeholder="输入问题,例如:这份文档的核心观点是什么?" autocomplete="off" />
+      <button class="btn-primary" id="sendBtn" type="submit">发送</button>
+    </form>
+  </div>
+
+  <script>
+    // ========== 状态 ==========
+    let docs = [];              // 已入库文档列表
+    let messages = [];          // 聊天记录 [{role, content}]
+    let loading = false;        // 是否正在等待回答
+
+    // ========== 文档列表:GET /api/docs ==========
+    async function refreshDocs() {
+      const r = await fetch('/api/docs');
+      const d = await r.json();
+      docs = d.docs || [];
+      const card = document.getElementById('docsCard');
+      const list = document.getElementById('docsList');
+      if (docs.length === 0) { card.style.display = 'none'; return; }
+      card.style.display = 'block';
+      list.innerHTML = docs.map(doc => `
+        <div class="doc-item">
+          <span class="doc-name">${escapeHtml(doc.name)}<span class="doc-meta">${doc.chunk_count} 段</span></span>
+          <button class="btn-danger" onclick="removeDoc('${doc.name.replace(/'/g, "\\'")}')">🗑️ 删除</button>
+        </div>`).join('');
+    }
+
+    // ========== 删除文档:DELETE /api/docs?name=xxx ==========
+    async function removeDoc(name) {
+      const r = await fetch('/api/docs?name=' + encodeURIComponent(name), { method: 'DELETE' });
+      const d = await r.json();
+      showMsg(d.ok ? `🗑️ 已删除「${name}」(${d.removed} 个片段)` : `❌ 删除失败:${d.error}`);
+      await refreshDocs();
+    }
+
+    // ========== 上传:POST /api/upload ==========
+    async function handleUpload() {
+      const input = document.getElementById('fileInput');
+      if (!input.files.length) return;
+      const fd = new FormData();
+      for (const f of input.files) fd.append('files', f);
+      document.getElementById('uploadBtn').disabled = true;
+      showMsg('正在解析和向量化…');
+      try {
+        const r = await fetch('/api/upload', { method: 'POST', body: fd });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.ok !== false) {
+          showMsg(`✅ 入库成功:${d.added} 个片段,文档:${(d.docs || []).join('、')}`);
+        } else {
+          showMsg(`❌ 失败:${d.error || ('HTTP ' + r.status)}`);
+        }
+        await refreshDocs();
+      } catch (e) { showMsg('❌ 上传失败,请重试'); }
+      document.getElementById('uploadBtn').disabled = false;
+      input.value = '';
+    }
+
+    // ========== 聊天:POST /api/chat(流式) ==========
+    async function sendMessage(e) {
+      e.preventDefault();
+      const input = document.getElementById('chatInput');
+      const question = input.value.trim();
+      if (!question || loading) return;
+
+      messages.push({ role: 'user', content: question });
+      input.value = '';
+      renderMessages();
+      loading = true;
+      document.getElementById('sendBtn').disabled = true;
+
+      // 1) 发请求
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages }),
+      });
+
+      // 2) 流式读取响应体:边收边渲染(打字机效果)
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let acc = '';
+      messages.push({ role: 'assistant', content: '' });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        acc += decoder.decode(value, { stream: true });
+        messages[messages.length - 1].content = acc;  // 更新最后一条消息
+        renderMessages();
+      }
+      loading = false;
+      document.getElementById('sendBtn').disabled = false;
+    }
+
+    // ========== 渲染聊天记录 ==========
+    function renderMessages() {
+      const box = document.getElementById('chatBox');
+      if (messages.length === 0) return;
+      box.innerHTML = messages.map(m => `
+        <div class="bubble ${m.role}">${escapeHtml(m.content) || (loading ? '思考中…' : '')}</div>`).join('');
+      box.scrollTop = box.scrollHeight;
+    }
+
+    // ========== 工具函数 ==========
+    function showMsg(text) { document.getElementById('uploadMsg').textContent = text; }
+    function escapeHtml(s) {
+      return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // 页面加载时拉取一次文档列表
+    refreshDocs();
+  </script>
+</body>
+</html>

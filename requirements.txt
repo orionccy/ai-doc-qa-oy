@@ -1,0 +1,12 @@
+# Python 版项目依赖清单
+# 安装命令: pip install -r requirements.txt
+# 或使用清华镜像(国内更快):
+#   pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+fastapi                # Web 框架,负责 HTTP 接口
+uvicorn[standard]      # ASGI 服务器,负责运行 FastAPI 应用
+python-multipart       # 处理文件上传(multipart/form-data)
+langchain              # LangChain 框架核心
+langchain-openai       # OpenAI 兼容接口封装(连 DeepSeek / 阿里百炼)
+langchain-text-splitters  # 文本切分器
+pypdf                  # PDF 解析
+python-docx            # Word(docx)解析
