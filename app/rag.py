@@ -28,6 +28,7 @@ from .config import (
     DEEPSEEK_CHAT_MODEL,
     EMBEDDING_MODEL,
     TOP_K,
+    MIN_SCORE,
 )
 from .parse import split_text
 from .storage import store
@@ -97,13 +98,17 @@ def _embed_in_batches(texts: List[str]) -> List[List[float]]:
     return vectors
 
 
-def ingest_document(doc_name: str, text: str) -> int:
+def ingest_document(doc_name: str, text: str, department: str = "default",
+                    uploader: str = "") -> int:
     """把一个文档的全文切分、向量化、入库,返回入库的片段数。
 
     三步:
-      1) splitter.split_text(text)         → 文本切分成若干小块
-      2) embeddings.embed_documents(chunks)→ 每块调百炼 API 转成向量
-      3) store.add_chunks(...)             → 文本+向量成对存进向量库
+      1) split_text(text)                    → 文本切分成若干小块
+      2) _embed_in_batches(chunks)            → 每块调百炼 API 转成向量
+      3) store.add_chunks(...)                → 文本+向量成对存进向量库(带部门标签)
+
+    department: 归属部门,入库时打标签——多租户隔离的基础
+    uploader:   上传者用户名(管理员删用户时连带清理)
     """
     chunks = split_text(text)
     if not chunks:
@@ -111,27 +116,37 @@ def ingest_document(doc_name: str, text: str) -> int:
         return 0
     logger.info("文档 %s 切分为 %d 块,开始向量化", doc_name, len(chunks))
     vectors = _embed_in_batches(chunks)
-    added = store.add_chunks(doc_name, chunks, vectors)
+    added = store.add_chunks(doc_name, chunks, vectors,
+                             department=department, uploader=uploader)
     logger.info("文档 %s 入库完成:新增 %d 块", doc_name, added)
     return added
 
 
 # ================= 3. 问答流程(流式) =================
-def ask_question(question: str) -> Iterator[str]:
+def ask_question(question: str, department: str = "default") -> Iterator[str]:
     """RAG 问答:检索 → 组装 → 流式生成。返回逐段文本的迭代器。
 
     为什么是 Iterator(生成器)?
     生成器是"惰性"的——每次产出一点文本就交给 FastAPI 转发给前端,
     用户立刻看到第一个字,不用等全部生成完。
+
+    department: 部门过滤——只检索当前用户所在部门的知识库(多租户隔离)
     """
     # 1) 问题向量化:把用户问题转成向量,才能和库里的块比相似度
     q_vector = embeddings.embed_query(question)
 
-    # 2) 检索:从库里挑出与问题最相似的 TOP_K 个片段
-    hits = store.search(q_vector, TOP_K)
-    logger.info("检索命中 %d 块,开始生成回答", len(hits))
+    # 2) 检索:只在本部门数据里挑出最相似的 TOP_K 个片段
+    hits = store.search(q_vector, TOP_K, department=department)
+    logger.info("检索命中 %d 块(部门:%s),开始生成回答", len(hits), department)
 
-    # 健壮性:知识库为空/没命中时,直接友好提示,不白调一次大模型
+    # 2.5) 相关性阈值过滤(防幻觉):相似度太低的片段视为"没查到"
+    # 宁可不答,不要拿不相关内容 + 模型自由发挥编造
+    hits = [h for h in hits if h.get("score", 0) >= MIN_SCORE]
+    if hits:
+        logger.info("阈值过滤后保留 %d 块(最高分 %.3f)",
+                    len(hits), max(h["score"] for h in hits))
+
+    # 健壮性:知识库为空/没命中/相关性不足时,直接友好提示,不白调一次大模型
     if not hits:
         yield "知识库中还没有相关内容,请先上传文档(txt/md/pdf/docx)再提问。"
         return

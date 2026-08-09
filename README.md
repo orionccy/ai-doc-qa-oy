@@ -4,15 +4,19 @@
 
 ## ✨ 功能特性
 
+- 🔐 **多租户权限体系**:注册/登录(JWT)、部门隔离(不同部门只能看到本部门文档)、管理员用户管理
 - 📤 **多格式文档上传**:支持 txt / md / pdf / docx,自动解析
-- 🔍 **RAG 检索增强问答**:向量化检索 Top-K 相关片段,回答带来源标注
+- 🔍 **RAG 检索增强问答**:向量检索(Chroma 向量库)+ 相关性阈值防幻觉,回答带来源标注
 - ⚡ **流式输出**:打字机效果,边生成边显示
-- 📚 **知识库管理**:文档列表、单文档删除、JSON 文件持久化(重启不丢)
+- 💬 **对话历史持久化**:刷新页面聊天记录不丢(SQLite)
+- 📚 **知识库管理**:文档列表、单文档删除、按部门隔离
 - 🛡️ **企业级加固**:
+  - bcrypt 密码哈希(含老数据自动迁移)、JWT 密钥环境变量化
   - 结构化日志(请求中间件 + 业务打点)
   - 全局异常处理 + 超时 + 自动重试
   - 上传大小限制(20MB)、扩展名白名单、文件名清洗、输入校验
 - ✅ **CI 流水线**:GitHub Actions 自动跑语法检查 + 单元测试
+- 🐳 **全栈容器化**:docker compose 一键启动 前端(Nginx)+ 后端(FastAPI)
 
 ## 🛠️ 技术栈
 
@@ -22,8 +26,11 @@
 | AI 框架 | LangChain (ChatOpenAI / OpenAIEmbeddings / RecursiveCharacterTextSplitter) |
 | 对话模型 | DeepSeek (`deepseek-chat`) |
 | 向量模型 | 阿里百炼 (`text-embedding-v3`) |
-| 存储 | 本地 JSON 文件(极简向量存储,余弦相似度检索) |
-| 前端 | 原生 HTML/JS(零框架依赖) |
+| 向量数据库 | Chroma(元数据过滤 + 余弦检索) |
+| 存储 | SQLite(用户/部门/对话历史)、Chroma(知识库) |
+| 认证 | JWT + bcrypt |
+| 前端 | Vue3 + Vite + Pinia + Vue Router(Nginx 托管) |
+| 部署 | Docker Compose(前端 + 后端一键启动) |
 
 ## 🚀 快速开始
 

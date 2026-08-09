@@ -1,154 +1,238 @@
 """FastAPI 应用入口:定义所有 HTTP 接口,并托管前端页面。
 
 接口一览:
-  GET    /                    返回前端页面(index.html)
-  POST   /api/upload          上传文档 → 解析 → 切分 → 向量化 → 入库
-  POST   /api/chat            问答(流式返回文本,类似 SSE)
-  GET    /api/docs            已入库文档列表
-  DELETE /api/docs?name=xxx   删除指定文档
+  POST   /api/register     注册(用户名/密码/部门)
+  POST   /api/login        登录 → 返回 JWT token
+  GET    /api/me           当前登录用户信息(前端显示部门/角色用)
+  GET    /api/users        用户列表(仅管理员)
+  DELETE /api/users/{name} 删除用户(仅管理员)
+  POST   /api/upload       上传文档 → 解析 → 切分 → 向量化 → 入库(需登录)
+  POST   /api/chat         问答(流式,需登录,只查本部门知识库)
+  GET    /api/docs         本部门文档列表(需登录)
+  DELETE /api/docs?name=xx 删除本部门文档(需登录)
 
-FastAPI 的魔法:
-  - 函数参数里写 UploadFile / dict,框架自动帮你解析请求体
-  - 返回 dict 自动转成 JSON;返回 StreamingResponse 做流式传输
+多租户设计(企业级):
+  - 每个用户属于一个部门(注册时指定)
+  - 文档入库时打部门标签;查询时强制按"当前登录用户的部门"过滤
+  - 部门 ID 只从 JWT 解析,绝不信任前端传参——这是数据隔离的核心
 """
 import logging
+import sqlite3
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from .auth import create_token, get_current_user
+from .chat_store import chat_store
 from .config import BASE_DIR
 from .parse import extract_text
 from .rag import ask_question, ingest_document
 from .storage import store
+from .user_store import User, user_store
 
 # ================= 日志配置(企业级第一步) =================
-# logging 是 Python 标准库,不用装任何东西
-# 级别从低到高:DEBUG < INFO < WARNING < ERROR < CRITICAL
-# 生产环境一般开到 INFO:看到正常流程 + 警告 + 错误,不刷屏
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("ai-doc-qa")  # 用模块名区分日志来源
+logger = logging.getLogger("ai-doc-qa")
 
-app = FastAPI(title="AI 文档问答助手")
+app = FastAPI(title="AI 文档问答助手(多租户版)")
 
-# 托管前端静态文件:浏览器访问 /static/... 会映射到 static/ 目录
-# 用 __file__ 定位,保证无论从哪启动都能找到(相对 main.py 所在目录)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-# ================= 请求日志中间件(企业级第一步) =================
-# 中间件 = 每个请求进来/出去时都会经过的"关卡"
-# 作用:记录 谁在什么时间调了哪个接口、花了多久、结果如何
+# ================= 请求日志中间件 =================
 @app.middleware("http")
 async def log_requests(request, call_next):
-    start = time.perf_counter()  # 高精度计时
-    response = await call_next(request)  # 放行请求,拿到响应
+    start = time.perf_counter()
+    response = await call_next(request)
     cost_ms = (time.perf_counter() - start) * 1000
     logger.info(
         "%s %s -> %s (%.0fms)",
-        request.method,          # 请求方法 GET/POST/DELETE
-        request.url.path,        # 请求路径 /api/upload ...
-        response.status_code,    # 响应状态码 200/400/500
-        cost_ms,                 # 耗时毫秒
+        request.method, request.url.path, response.status_code, cost_ms,
     )
     return response
 
 
-# ================= 全局异常处理器(企业级第二步) =================
-# 兜底机制:任何接口里没被 try/except 接住的异常,都会走到这里。
-# 作用:1) 完整堆栈记进日志(方便排查) 2) 返回友好的 JSON,不把堆栈裸给用户
+# ================= 全局异常处理器 =================
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.exception("未捕获异常:%s %s", request.method, request.url.path)
     return JSONResponse({"error": "服务器内部错误,请稍后重试"}, status_code=500)
 
 
-# ================= 安全配置(企业级第三步) =================
-# 1) 上传大小限制:防止恶意大文件耗尽服务器内存/带宽
+# ================= 安全配置 =================
 MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
-# 2) 扩展名白名单:只允许明确支持的格式,其余一律拒绝
 ALLOWED_EXTENSIONS = {"txt", "md", "markdown", "pdf", "docx", "csv", "json", "log", "html"}
-# 3) 密钥保护:API key 只从 .env 读取,不进代码、不进日志(已由 config.py 保证)
+
+# 可选的部门列表(前端注册页下拉用;也允许自定义,企业可改成从数据库读)
+DEFAULT_DEPARTMENTS = ["研发部", "市场部", "销售部", "客服部", "财务部", "人事部"]
 
 
-# ================= 页面 =================
-@app.get("/")
-def index():
-    """访问 http://localhost:8000 时返回前端页面。"""
-    return FileResponse(STATIC_DIR / "index.html")
+# ================= 认证:注册 / 登录 =================
+@app.post("/api/register")
+def register(payload: dict):
+    """注册新用户。参数:{username, password, department}
+
+    第一个注册的用户自动成为 admin(方便初始化);
+    之后注册的都是普通用户(user)。
+    """
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    department = (payload.get("department") or "").strip()
+
+    # 输入校验:不允许空值,密码至少 6 位(企业最小要求)
+    if not username or not password or not department:
+        return JSONResponse({"error": "用户名/密码/部门不能为空"}, status_code=400)
+    if len(password) < 6:
+        return JSONResponse({"error": "密码长度至少 6 位"}, status_code=400)
+
+    # 第一个用户自动成为管理员
+    role = "admin" if len(user_store.list_users()) == 0 else "user"
+    # 用户名不区分大小写:注册前检查是否已存在(否则大小写变体可重复注册)
+    if user_store.get_user(username) is not None:
+        return JSONResponse({"error": "用户名已存在"}, status_code=409)
+    try:
+        user = user_store.create_user(username, password, department, role)
+    except sqlite3.IntegrityError:
+        return JSONResponse({"error": "用户名已存在"}, status_code=409)
+    logger.info("新用户注册:%s (部门:%s, 角色:%s)", username, department, role)
+    return {"ok": True, "user": user.to_dict()}
 
 
-# ================= 上传入库 =================
+@app.post("/api/login")
+def login(payload: dict):
+    """登录:校验用户名密码,签发 JWT token。"""
+    username = (payload.get("username") or "").strip()
+    password = payload.get("password") or ""
+    user = user_store.verify_password(username, password)
+    if user is None:
+        return JSONResponse({"error": "用户名或密码错误"}, status_code=401)
+    token = create_token(user)
+    logger.info("用户登录:%s (部门:%s)", username, user.department)
+    return {"ok": True, "token": token, "user": user.to_dict()}
+
+
+@app.get("/api/me")
+def me(user: User = Depends(get_current_user)):
+    """返回当前登录用户信息(前端顶部栏显示用)。"""
+    return user.to_dict()
+
+
+# ================= 用户管理(仅管理员) =================
+@app.get("/api/users")
+def list_users(user: User = Depends(get_current_user)):
+    """用户列表。普通用户只能看自己,管理员看全部。"""
+    if user.role == "admin":
+        return {"users": user_store.list_users()}
+    return {"users": [u for u in user_store.list_users() if u["username"] == user.username]}
+
+
+@app.delete("/api/users/{username}")
+def delete_user(username: str, user: User = Depends(get_current_user)):
+    """删除用户(仅管理员),顺带删除该用户的文档。"""
+    if user.role != "admin":
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    if username == user.username:
+        return JSONResponse({"error": "不能删除自己"}, status_code=400)
+    removed = store.delete_doc_by_uploader(username)
+    deleted = user_store.delete_user(username)
+    if not deleted:
+        return JSONResponse({"error": "用户不存在"}, status_code=404)
+    logger.info("管理员 %s 删除了用户 %s(清理文档 %d 块)", user.username, username, removed)
+    return {"ok": True, "deleted": deleted, "removed_docs": removed}
+
+
+@app.post("/api/users/{username}/reset-password")
+def reset_password(username: str, payload: dict, user: User = Depends(get_current_user)):
+    """重置用户密码(仅管理员)。参数:{new_password}"""
+    if user.role != "admin":
+        return JSONResponse({"error": "需要管理员权限"}, status_code=403)
+    new_password = payload.get("new_password") or ""
+    if len(new_password) < 6:
+        return JSONResponse({"error": "新密码长度至少 6 位"}, status_code=400)
+    ok = user_store.update_password(username, new_password)
+    if not ok:
+        return JSONResponse({"error": "用户不存在"}, status_code=404)
+    logger.info("管理员 %s 重置了用户 %s 的密码", user.username, username)
+    return {"ok": True}
+
+
+@app.get("/api/departments")
+def departments():
+    """可选部门列表(注册页下拉用)。"""
+    return {"departments": DEFAULT_DEPARTMENTS}
+
+
+# ================= 上传入库(需登录,归属当前部门) =================
 @app.post("/api/upload")
-async def upload(files: list[UploadFile] = File(...)):
+async def upload(
+    files: list[UploadFile] = File(...),
+    user: User = Depends(get_current_user),
+):
     """接收一个或多个文件:解析 → 切分 → 向量化 → 入库。
 
-    安全三道关(企业级第三步):
-      1) 大小限制:超过 20MB 直接拒绝
-      2) 类型白名单:不在白名单的扩展名直接拒绝
-      3) 文件名清洗:只取文件名本身,去掉路径部分(防路径注入,也覆盖空文件名)
+    多租户:文档归属当前登录用户的部门(department 从 token 取,不信任前端)。
     """
     result = {"added": 0, "docs": []}
     for f in files:
-        # 安全关卡 1:大小限制(读取后判断,防大文件耗尽内存)
+        # 安全关卡 1:大小限制
         data = await f.read()
         if len(data) > MAX_FILE_SIZE:
             logger.warning("拒绝超限文件:%s (%dMB)", f.filename, len(data) // 1024 // 1024)
             return JSONResponse({"error": f"{f.filename} 超过 20MB 大小限制"}, status_code=413)
 
-        # 安全关卡 3:文件名清洗。
-        # Path(...).name 只保留文件名部分,天然去掉 "../" 等路径注入;
-        # 文件名为空(None 或空串)也在这里统一拦截。
+        # 安全关卡 2:文件名清洗(防路径注入)
         safe_name = Path(f.filename).name if f.filename else ""
         if not safe_name:
             logger.warning("拒绝空文件名上传")
             return JSONResponse({"error": "文件名不能为空"}, status_code=400)
 
-        # 安全关卡 2:类型白名单
+        # 安全关卡 3:类型白名单
         ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
         if ext not in ALLOWED_EXTENSIONS:
             logger.warning("拒绝不支持类型:%s (.%s)", safe_name, ext)
             return JSONResponse({"error": f"不支持的文件类型: .{ext}"}, status_code=400)
 
         try:
-            text = extract_text(safe_name, data)          # 解析成纯文本
-            n = ingest_document(safe_name, text)          # 走 RAG 入库流程
+            text = extract_text(safe_name, data)
+            # 多租户:入库打上当前用户的部门标签 + 上传者(审计用)
+            n = ingest_document(safe_name, text,
+                                department=user.department, uploader=user.username)
             if n > 0:
                 result["added"] += n
                 result["docs"].append(safe_name)
         except Exception as e:
-            # 企业级错误处理:异常必须打日志(含完整堆栈),不能只返回给前端
             logger.exception("上传文件 %s 处理失败", safe_name)
             return JSONResponse({"error": f"{safe_name}: {e}"}, status_code=500)
     return {
         **result,
-        "docs_list": store.list_docs(),      # 最新文档列表(前端刷新用)
-        "chunk_count": store.total_chunks(), # 总片段数
+        "docs_list": store.list_docs(department=user.department),
+        "chunk_count": store.total_chunks(department=user.department),
     }
 
 
-# ================= 问答(流式) =================
+# ================= 问答(流式,只查本部门) =================
 @app.post("/api/chat")
-async def chat(payload: dict):
+async def chat(
+    payload: dict,
+    user: User = Depends(get_current_user),
+):
     """RAG 问答接口。请求体:{"messages": [{"role":"user","content":"问题"}]}
 
-    返回:流式纯文本。StreamingResponse 会逐段把生成器产出转发给前端,
-    浏览器收到后立刻开始渲染(打字机效果)。
+    多租户:ask_question 只检索当前用户部门的文档——数据隔离在这里生效。
+    对话持久化:用户问题和助手回答都存入 SQLite,刷新页面不丢。
     """
-    # 输入校验(企业级第三步):messages 必须是合法的消息列表,否则拒绝
-    # 防止格式错误的请求进来,也让接口契约更明确
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return JSONResponse({"error": "消息格式不正确"}, status_code=400)
 
-    # 从对话历史里取最后一条用户消息作为问题
     question = ""
     for m in reversed(messages):
         if m.get("role") == "user":
@@ -156,31 +240,63 @@ async def chat(payload: dict):
             break
     if not question:
         return JSONResponse({"error": "没有收到问题"}, status_code=400)
-    return StreamingResponse(
-        ask_question(question), media_type="text/plain; charset=utf-8"
-    )
+
+    # 保存用户消息(持久化)
+    chat_store.add_message(user.username, "user", question)
+
+    def generate():
+        """包装生成器:边流式输出,边收集完整回答;结束后落库保存。"""
+        collected: list[str] = []
+        try:
+            for chunk in ask_question(question, department=user.department):
+                collected.append(chunk)
+                yield chunk
+        finally:
+            # 无论正常结束还是客户端断开,都尽量保存已生成的部分
+            if collected:
+                chat_store.add_message(user.username, "assistant", "".join(collected))
+
+    return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
 
 
-# ================= 文档管理 =================
+@app.get("/api/history")
+def history(user: User = Depends(get_current_user)):
+    """拉取当前用户的对话历史(最近 100 条,时间正序)。"""
+    return {"messages": chat_store.list_messages(user.username, limit=100)}
+
+
+@app.delete("/api/history")
+def clear_history(user: User = Depends(get_current_user)):
+    """清空当前用户的对话历史。"""
+    removed = chat_store.clear_history(user.username)
+    return {"ok": True, "removed": removed}
+
+
+# ================= 文档管理(本部门可见) =================
 @app.get("/api/docs")
-def list_docs():
-    """已入库文档列表(前端页面加载时调用)。"""
-    return {"docs": store.list_docs(), "chunk_count": store.total_chunks()}
+def list_docs(user: User = Depends(get_current_user)):
+    """本部门已入库文档列表。"""
+    return {
+        "docs": store.list_docs(department=user.department),
+        "chunk_count": store.total_chunks(department=user.department),
+    }
 
 
 @app.delete("/api/docs")
-def delete_doc(name: str):
-    """删除指定文档。FastAPI 自动从 URL 参数 ?name=xxx 取值。"""
+def delete_doc(name: str, user: User = Depends(get_current_user)):
+    """删除本部门的指定文档(无法删除其他部门文档)。"""
     if not name:
         return JSONResponse({"error": "缺少文档名"}, status_code=400)
-    removed = store.delete_doc(name)
-    return {"ok": True, "removed": removed, "chunk_count": store.total_chunks()}
+    removed = store.delete_doc(name, department=user.department)
+    return {
+        "ok": True,
+        "removed": removed,
+        "chunk_count": store.total_chunks(department=user.department),
+    }
 
 
 # ================= 启动入口 =================
 if __name__ == "__main__":
-    # 直接在项目根目录运行:python -m app.main
-    # 或使用命令:.venv/bin/uvicorn app.main:app --reload
     import uvicorn
 
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)

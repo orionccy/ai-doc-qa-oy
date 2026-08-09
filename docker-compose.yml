@@ -1,0 +1,25 @@
+# ============ docker-compose.yml:一键启动编排(全栈) ============
+# 一条 docker compose up -d 启动:前端(Nginx) + 后端(FastAPI)
+# 前端 80 端口提供页面,/api 反向代理到后端;密钥走 env_file 不进镜像
+services:
+  # ---- 后端:AI 文档问答 API ----
+  ai-doc-qa:
+    build: .
+    container_name: ai-doc-qa
+    ports:
+      - "8000:8000"          # 宿主机8000 -> 容器8000(API 直连调试用)
+    env_file:
+      - .env                 # 密钥从 .env 注入容器环境变量(不进镜像)
+    volumes:
+      - ./data:/app/.data    # 数据卷:知识库/用户/历史持久化到宿主机 ./data
+    restart: unless-stopped  # 异常退出/开机自动重启
+
+  # ---- 前端:Vue3 + Nginx ----
+  web:
+    build: ./frontend        # 前端 Dockerfile 在 frontend/ 目录
+    container_name: ai-doc-qa-web
+    ports:
+      - "80:80"              # 浏览器访问 http://localhost 即前端页面
+    depends_on:
+      - ai-doc-qa            # 等后端就绪再启动(网络层面)
+    restart: unless-stopped

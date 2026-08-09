@@ -10,3 +10,6 @@ langchain-openai       # OpenAI 兼容接口封装(连 DeepSeek / 阿里百炼)
 langchain-text-splitters  # 文本切分器
 pypdf                  # PDF 解析
 python-docx            # Word(docx)解析
+pyjwt                  # JWT 认证(token 签发与校验)
+bcrypt                 # 密码哈希(抗暴力破解)
+chromadb               # 向量数据库(多租户检索/元数据过滤)

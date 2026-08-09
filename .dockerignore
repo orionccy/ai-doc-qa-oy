@@ -1,0 +1,12 @@
+# 构建上下文里排除的文件(不进镜像,更小更安全)
+.venv/
+__pycache__/
+*.pyc
+.data/
+.env
+.git/
+tests/
+.github/
+Dockerfile
+docker-compose.yml
+.dockerignore

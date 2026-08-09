@@ -7,6 +7,8 @@
 import os
 from pathlib import Path
 
+from pydantic import SecretStr
+
 # ---------- 目录定义 ----------
 # BASE_DIR:项目根目录(本文件在 app/ 下,往上一级就是根目录)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -35,8 +37,8 @@ def load_env(path: Path = BASE_DIR / ".env") -> None:
 load_env()
 
 # ---------- API 密钥 ----------
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
-DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
+DEEPSEEK_API_KEY = SecretStr(os.getenv("DEEPSEEK_API_KEY", ""))
+DASHSCOPE_API_KEY = SecretStr(os.getenv("DASHSCOPE_API_KEY", ""))
 
 # ---------- 模型配置 ----------
 # DeepSeek 提供 OpenAI 兼容接口,base_url 指向它的标准端点
@@ -51,3 +53,18 @@ EMBEDDING_MODEL = "text-embedding-v3"  # 向量化模型
 CHUNK_SIZE = 600      # 每个文本块的最大字符数
 CHUNK_OVERLAP = 80    # 相邻块之间的重叠字符数(避免关键句被切断丢失)
 TOP_K = 5             # 提问时检索返回最相似的片段数
+# 相关性阈值:检索结果相似度低于该值视为"不相关",不给模型直接提示没找到。
+# 防幻觉关键(宁可不答,不要瞎答)。text-embedding-v3 的余弦分数:相关片段一般 >0.4
+MIN_SCORE = 0.35
+
+# ---------- 多租户与认证 ----------
+# USERS_DB:用户/部门数据文件(SQLite 格式,Python 内置支持,零依赖)
+USERS_DB = DATA_DIR / "users.db"
+# JWT 密钥:优先从 .env 读(生产必须配置),否则用开发密钥并打警告
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if not JWT_SECRET:
+    JWT_SECRET = "dev-secret-change-me-in-production"
+    import warnings
+    warnings.warn("JWT_SECRET 未配置,正在使用开发密钥!生产环境请在 .env 中设置 JWT_SECRET")
+# Token 有效期(分钟):过期后需要重新登录
+TOKEN_EXPIRE_MINUTES = 60 * 12

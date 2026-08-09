@@ -1,119 +1,169 @@
-"""向量存储模块:保存文档切片与向量,提供相似度检索。
+"""向量存储模块(Chroma 向量数据库版)。
 
-本模块自己实现了一个最简单的"向量数据库":
-- 数据存在内存列表 + 本地 JSON 文件(双保险:重启不丢)
-- 检索用余弦相似度暴力比对(数据量小时完全够用)
+从"自写 JSON 存储"升级为真正的向量数据库 Chroma:
+- 数据持久化在 .data/chroma/ 目录
+- 原生支持:向量检索(ANN 近似最近邻,数据量大时远快于暴力比对)、
+  metadata 过滤(部门/文档/上传者——多租户隔离的载体)、批量删除
+- 启动时自动把旧版 chunks.json 数据迁移进来(平滑升级)
 
-生产环境可以换成真正的向量数据库(Chroma / pgvector / Milvus),
-接口保持相似,业务代码几乎不用改——这就是"存储抽象"的意义。
+对外接口与旧版保持一致:add_chunks / search / list_docs / delete_doc /
+total_chunks / delete_doc_by_uploader——业务代码无需改动,这就是"存储抽象"的价值。
 """
 import json
 import math
-import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List
 
-from .config import DATA_DIR, CHUNKS_FILE
+import chromadb
+
+from .config import CHUNKS_FILE, DATA_DIR
 
 
 def cosine(a: List[float], b: List[float]) -> float:
-    """余弦相似度:衡量两个向量"方向"有多接近,范围 [-1, 1],越大越相似。
-
-    公式:cos(a,b) = (a·b) / (|a| * |b|)
-    只关心方向不关心长度,所以适合比较文本语义(与文本长短无关)。
-    设计为模块级纯函数:不依赖类状态,方便单元测试与复用。
-    """
-    dot = sum(x * y for x, y in zip(a, b))          # 点积
-    na = math.sqrt(sum(x * x for x in a))           # 向量 a 的模长
-    nb = math.sqrt(sum(x * x for x in b))           # 向量 b 的模长
-    return dot / (na * nb) if na and nb else 0.0    # 除零保护
+    """余弦相似度(保留纯函数,供测试与参考;实际检索由 Chroma 完成)。"""
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
 
 
 class VectorStore:
-    """极简向量存储。chunks 结构:
-    {
-        "id": 唯一id,            # 用于定位/删除
-        "doc_name": 来源文档名,   # 用于分组和删除
-        "text": 文本内容,         # 供大模型阅读
-        "embedding": [向量],      # 供相似度计算
-    }
+    """Chroma 向量存储。chunk 结构(Chroma 的 document + metadata):
+    - document: 文本内容(供大模型阅读)
+    - metadata: {doc_name, department, uploader}(多租户隔离/审计)
+    - embedding: 向量(供相似度检索)
     """
 
-    def __init__(self, data_file: Path | None = None) -> None:
-        # 数据文件可注入:生产用默认路径,测试传临时路径(便于单测隔离)
-        self.data_file = data_file or CHUNKS_FILE
-        self.chunks: List[Dict[str, Any]] = []
-        self._load()
-
-    # ================= 持久化 =================
-    def _load(self) -> None:
-        """启动时从 JSON 文件加载历史数据(服务重启知识库不丢)。"""
-        if self.data_file.exists():
-            self.chunks = json.loads(self.data_file.read_text(encoding="utf-8"))
-
-    def _save(self) -> None:
-        """内存数据写回 JSON 文件。"""
-        self.data_file.parent.mkdir(parents=True, exist_ok=True)
-        self.data_file.write_text(
-            json.dumps(self.chunks, ensure_ascii=False), encoding="utf-8"
+    def __init__(self, persist_dir: Path | None = None) -> None:
+        # 持久化目录可注入:生产用默认路径,测试传临时目录(便于单测隔离)
+        self.persist_dir = persist_dir or (DATA_DIR / "chroma")
+        self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.client = chromadb.PersistentClient(path=str(self.persist_dir))
+        # hnsw:space=cosine:用余弦距离做检索(1-余弦相似度 = 距离)
+        self.collection = self.client.get_or_create_collection(
+            "chunks", metadata={"hnsw:space": "cosine"}
         )
+        self._migrate_from_json()
+
+    # ================= 旧数据迁移(一次性的平滑升级) =================
+    def _migrate_from_json(self) -> None:
+        """旧版 chunks.json → Chroma 自动导入。
+
+        条件:JSON 存在、有数据、且 Chroma 还是空的(防止重复导入)。
+        迁移成功后把 JSON 改名 .bak 备份,不再读取。
+        """
+        if not CHUNKS_FILE.exists() or self.collection.count() > 0:
+            return
+        try:
+            old_chunks = json.loads(CHUNKS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not old_chunks:
+            return
+        ids = [c["id"] for c in old_chunks]
+        embeddings = [c["embedding"] for c in old_chunks]
+        documents = [c["text"] for c in old_chunks]
+        metadatas = [
+            {
+                "doc_name": c.get("doc_name", "unknown"),
+                "department": c.get("department", "default"),
+                "uploader": c.get("uploader", ""),
+            }
+            for c in old_chunks
+        ]
+        self.collection.add(ids=ids, embeddings=embeddings,
+                            documents=documents, metadatas=metadatas)
+        CHUNKS_FILE.rename(CHUNKS_FILE.with_suffix(".json.bak"))
+        print(f"[迁移] 旧 JSON 数据 {len(old_chunks)} 块已导入 Chroma,原文件已备份")
 
     # ================= 写入 =================
     def add_chunks(
-        self, doc_name: str, texts: List[str], embeddings: List[List[float]]
+        self, doc_name: str, texts: List[str], embeddings: List[List[float]],
+        department: str = "default", uploader: str = "",
     ) -> int:
-        """入库:把 (文本, 向量) 成对追加进存储,返回入库块数。
+        """入库:文档切片 + 向量 + 元数据(部门/上传者)写入 Chroma。
 
-        doc_name:   来源文档名(用于前端展示与删除)
-        texts:      切分后的文本块列表
-        embeddings: 与 texts 一一对应的向量列表
+        Chroma 要求:ids 唯一;embeddings/documents/metadatas 长度一致
         """
-        now = time.time()
-        for i, (text, emb) in enumerate(zip(texts, embeddings)):
-            self.chunks.append(
-                {
-                    "id": f"{now}-{i}-{uuid.uuid4().hex[:6]}",  # 时间戳+随机,保证唯一
-                    "doc_name": doc_name,
-                    "text": text,
-                    "embedding": emb,
-                }
-            )
-        self._save()
+        ids = [f"{uuid.uuid4().hex}" for _ in texts]
+        metadatas = [
+            {"doc_name": doc_name, "department": department, "uploader": uploader}
+            for _ in texts
+        ]
+        self.collection.add(
+            ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas
+        )
         return len(texts)
 
     # ================= 检索 =================
-    def search(self, query_embedding: List[float], top_k: int = 5) -> List[Dict[str, Any]]:
-        """检索:把问题向量和库里每个块向量算相似度,返回最相似的 top_k 块。
+    def search(
+        self, query_embedding: List[float], top_k: int = 5,
+        department: str | None = None,
+    ) -> List[Dict[str, Any]]:
+        """检索:向量相似度 + 部门过滤(多租户隔离)。
 
-        query_embedding: 问题文本的向量(由 embedding 模型生成)
+        先隔离后检索:where 在数据库层过滤,不会把别的部门数据参与打分。
+        score = 1 - cosine_distance(Chroma 返回距离,0=完全相同)。
         """
-        scored = [
-            (cosine(query_embedding, c["embedding"]), c) for c in self.chunks
-        ]
-        scored.sort(key=lambda x: x[0], reverse=True)   # 相似度从高到低
-        return [c for _, c in scored[:top_k]]
+        where = {"department": department} if department else None
+        res = self.collection.query(
+            query_embeddings=[query_embedding], n_results=top_k, where=where
+        )
+        results: List[Dict[str, Any]] = []
+        # Chroma 返回结构:ids/documents/metadatas/distances 都是 [[...]] 二维
+        ids = res.get("ids", [[]])[0]
+        docs = res.get("documents", [[]])[0]
+        metas = res.get("metadatas", [[]])[0]
+        dists = res.get("distances", [[]])[0]
+        for i in range(len(ids)):
+            m = metas[i] or {}
+            results.append({
+                "id": ids[i],
+                "doc_name": m.get("doc_name", ""),
+                "text": docs[i],
+                "department": m.get("department", ""),
+                "uploader": m.get("uploader", ""),
+                "score": round(1 - dists[i], 4),  # 距离→相似度
+            })
+        return results
 
     # ================= 文档管理 =================
-    def list_docs(self) -> List[Dict[str, Any]]:
-        """按文档名聚合,返回每个文档的片段数(供前端列表展示)。"""
+    def list_docs(self, department: str | None = None) -> List[Dict[str, Any]]:
+        """按文档名聚合,返回每个文档的片段数(可按部门过滤)。"""
+        where = {"department": department} if department else None
+        res = self.collection.get(where=where, include=["metadatas"])
         counts: Dict[str, int] = {}
-        for c in self.chunks:
-            counts[c["doc_name"]] = counts.get(c["doc_name"], 0) + 1
-        return [{"name": n, "chunk_count": cnt} for n, cnt in counts.items()]
+        for m in res.get("metadatas", []):
+            name = (m or {}).get("doc_name", "unknown")
+            counts[name] = counts.get(name, 0) + 1
+        return [{"name": n, "chunk_count": c} for n, c in counts.items()]
 
-    def delete_doc(self, name: str) -> int:
-        """删除某个文档的所有片段,返回删除了多少块。"""
-        before = len(self.chunks)
-        self.chunks = [c for c in self.chunks if c["doc_name"] != name]
-        self._save()
-        return before - len(self.chunks)
+    def delete_doc(self, name: str, department: str | None = None) -> int:
+        """删除某个文档的所有片段(可按部门限权),返回删除块数。"""
+        where: Dict[str, str] = {"doc_name": name}
+        if department:
+            where["department"] = department
+        res = self.collection.get(where=where)
+        ids = res.get("ids", [])
+        if ids:
+            self.collection.delete(ids=ids)
+        return len(ids)
 
-    def total_chunks(self) -> int:
-        """当前知识库总片段数。"""
-        return len(self.chunks)
+    def total_chunks(self, department: str | None = None) -> int:
+        """总片段数(可按部门统计)。"""
+        if department is None:
+            return self.collection.count()
+        return len(self.collection.get(where={"department": department}).get("ids", []))
+
+    def delete_doc_by_uploader(self, uploader: str) -> int:
+        """删除某上传者的全部文档(管理员删用户时调用),返回删除块数。"""
+        res = self.collection.get(where={"uploader": uploader})
+        ids = res.get("ids", [])
+        if ids:
+            self.collection.delete(ids=ids)
+        return len(ids)
 
 
 # 全局单例:整个应用共享同一个存储对象
-# (FastAPI 每个请求是独立的,但模块级对象只初始化一次,大家共用)
 store = VectorStore()
