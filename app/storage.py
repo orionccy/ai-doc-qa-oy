@@ -130,14 +130,23 @@ class VectorStore:
 
     # ================= 文档管理 =================
     def list_docs(self, department: str | None = None) -> List[Dict[str, Any]]:
-        """按文档名聚合,返回每个文档的片段数(可按部门过滤)。"""
+        """按文档名聚合,返回每个文档的片段数(可按部门过滤)。
+
+        返回带 department 字段:管理员视角需要区分文档属于哪个部门。
+        """
         where = {"department": department} if department else None
         res = self.collection.get(where=where, include=["metadatas"])
-        counts: Dict[str, int] = {}
+        counts: Dict[str, Dict[str, Any]] = {}
         for m in res.get("metadatas", []):
-            name = (m or {}).get("doc_name", "unknown")
-            counts[name] = counts.get(name, 0) + 1
-        return [{"name": n, "chunk_count": c} for n, c in counts.items()]
+            m = m or {}
+            name = m.get("doc_name", "unknown")
+            if name not in counts:
+                counts[name] = {"chunk_count": 0, "department": m.get("department", "")}
+            counts[name]["chunk_count"] += 1
+        return [
+            {"name": n, "chunk_count": v["chunk_count"], "department": v["department"]}
+            for n, v in counts.items()
+        ]
 
     def delete_doc(self, name: str, department: str | None = None) -> int:
         """删除某个文档的所有片段(可按部门限权),返回删除块数。"""

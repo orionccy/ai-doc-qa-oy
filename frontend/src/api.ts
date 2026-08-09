@@ -82,11 +82,13 @@ export const api = {
     }),
 
   // 文档
-  listDocs: () => request<{ docs: { name: string; chunk_count: number }[]; chunk_count: number }>('/api/docs'),
+  listDocs: () => request<{ docs: { name: string; chunk_count: number; department?: string }[]; chunk_count: number }>('/api/docs'),
   history: () => request<{ messages: { role: string; content: string }[] }>('/api/history'),
-  upload: (files: File[]) => {
+  upload: (files: File[], department?: string) => {
     const fd = new FormData()
     files.forEach((f) => fd.append('files', f))
+    // 管理员可指定目标部门(普通用户后端会强制用自己部门,传了也无效)
+    if (department) fd.append('department', department)
     // 上传是 multipart,不能带 Content-Type(浏览器自动加 boundary)
     const headers: Record<string, string> = {}
     const token = getToken()

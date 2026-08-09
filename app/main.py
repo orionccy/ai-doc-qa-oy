@@ -21,7 +21,7 @@ import sqlite3
 import time
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -174,12 +174,21 @@ def departments():
 @app.post("/api/upload")
 async def upload(
     files: list[UploadFile] = File(...),
+    department: str = Form(""),
     user: User = Depends(get_current_user),
 ):
     """接收一个或多个文件:解析 → 切分 → 向量化 → 入库。
 
-    多租户:文档归属当前登录用户的部门(department 从 token 取,不信任前端)。
+    多租户规则:
+    - 普通用户:文档强制归属自己部门(忽略前端传的 department)
+    - 管理员:可指定 department 参数,把文档传到任意部门(默认"全局")
     """
+    # 目标部门:普通用户强制用自己部门;admin 可用前端指定(默认为"全局")
+    if user.role == "admin":
+        target_dept = department.strip() or "全局"
+    else:
+        target_dept = user.department
+
     result = {"added": 0, "docs": []}
     for f in files:
         # 安全关卡 1:大小限制
@@ -202,9 +211,9 @@ async def upload(
 
         try:
             text = extract_text(safe_name, data)
-            # 多租户:入库打上当前用户的部门标签 + 上传者(审计用)
+            # 多租户:入库打上目标部门标签 + 上传者(审计用)
             n = ingest_document(safe_name, text,
-                                department=user.department, uploader=user.username)
+                                department=target_dept, uploader=user.username)
             if n > 0:
                 result["added"] += n
                 result["docs"].append(safe_name)
@@ -213,8 +222,8 @@ async def upload(
             return JSONResponse({"error": f"{safe_name}: {e}"}, status_code=500)
     return {
         **result,
-        "docs_list": store.list_docs(department=user.department),
-        "chunk_count": store.total_chunks(department=user.department),
+        "docs_list": store.list_docs(department=target_dept),
+        "chunk_count": store.total_chunks(department=target_dept),
     }
 
 
@@ -275,18 +284,33 @@ def clear_history(user: User = Depends(get_current_user)):
 # ================= 文档管理(本部门可见) =================
 @app.get("/api/docs")
 def list_docs(user: User = Depends(get_current_user)):
-    """本部门已入库文档列表。"""
+    """文档列表。
+
+    - 普通用户:只看自己部门
+    - 管理员:看全部部门(每个文档带部门标识)
+    """
+    if user.role == "admin":
+        docs = store.list_docs(department=None)
+        return {"docs": docs, "chunk_count": store.total_chunks()}
+    docs = store.list_docs(department=user.department)
     return {
-        "docs": store.list_docs(department=user.department),
+        "docs": docs,
         "chunk_count": store.total_chunks(department=user.department),
     }
 
 
 @app.delete("/api/docs")
 def delete_doc(name: str, user: User = Depends(get_current_user)):
-    """删除本部门的指定文档(无法删除其他部门文档)。"""
+    """删除文档。
+
+    - 普通用户:只能删自己部门的文档
+    - 管理员:可删任意部门文档
+    """
     if not name:
         return JSONResponse({"error": "缺少文档名"}, status_code=400)
+    if user.role == "admin":
+        removed = store.delete_doc(name, department=None)
+        return {"ok": True, "removed": removed, "chunk_count": store.total_chunks()}
     removed = store.delete_doc(name, department=user.department)
     return {
         "ok": True,

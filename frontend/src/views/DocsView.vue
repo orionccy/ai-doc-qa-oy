@@ -2,14 +2,19 @@
 // ============ 知识库文档管理页:上传 / 列表 / 删除 ============
 import { ref, onMounted } from 'vue'
 import { api } from '../api'
+import { useUserStore as useUser } from '../stores/user'
 
-interface DocItem { name: string; chunk_count: number }
+interface DocItem { name: string; chunk_count: number; department?: string }
 
 const docs = ref<DocItem[]>([])
 const totalChunks = ref(0)
 const uploading = ref(false)
 const msg = ref('')
 const msgType = ref<'ok' | 'err'>('ok')
+// 管理员上传时的目标部门选择
+const isAdmin = ref(false)
+const targetDept = ref('')
+const departments = ref<string[]>(['全局'])
 
 // 加载文档列表
 async function loadDocs() {
@@ -18,15 +23,15 @@ async function loadDocs() {
   totalChunks.value = res.chunk_count
 }
 
-// 上传(支持多选)
+// 上传(支持多选;管理员可指定目标部门)
 async function onUpload(e: Event) {
   const files = (e.target as HTMLInputElement).files
   if (!files || files.length === 0) return
   uploading.value = true
   msg.value = ''
   try {
-    const res = await api.upload(Array.from(files))
-    showMsg(`✅ 成功入库 ${res.added} 个片段`, 'ok')
+    const res = await api.upload(Array.from(files), isAdmin.value ? targetDept.value : undefined)
+    showMsg(`✅ 成功入库 ${res.added} 个片段${isAdmin.value ? ` → ${targetDept.value}` : ''}`, 'ok')
     loadDocs()
   } catch (err: any) {
     showMsg(`❌ ${err.message}`, 'err')
@@ -37,11 +42,11 @@ async function onUpload(e: Event) {
 }
 
 // 删除
-async function removeDoc(name: string) {
-  if (!confirm(`确定删除「${name}」吗?`)) return
+async function removeDoc(d: DocItem) {
+  if (!confirm(`确定删除「${d.name}」吗?${isAdmin.value ? `(部门:${d.department})` : ''}`)) return
   try {
-    await api.deleteDoc(name)
-    showMsg(`🗑️ 已删除「${name}」`, 'ok')
+    await api.deleteDoc(d.name)
+    showMsg(`🗑️ 已删除「${d.name}」`, 'ok')
     loadDocs()
   } catch (err: any) {
     showMsg(`❌ ${err.message}`, 'err')
@@ -54,7 +59,17 @@ function showMsg(text: string, type: 'ok' | 'err') {
   setTimeout(() => (msg.value = ''), 4000)
 }
 
-onMounted(loadDocs)
+onMounted(async () => {
+  const userStore = useUser()
+  isAdmin.value = userStore.user?.role === 'admin'
+  if (isAdmin.value) {
+    try {
+      const res = await api.departments()
+      departments.value = ['全局', ...res.departments]
+    } catch { /* 拉不到用默认 */ }
+  }
+  loadDocs()
+})
 </script>
 
 <template>
@@ -62,14 +77,19 @@ onMounted(loadDocs)
     <div class="head">
       <div>
         <h2>📚 知识库文档</h2>
-        <p class="sub">共 {{ docs.length }} 个文档 · {{ totalChunks }} 个片段(仅本部门可见)</p>
+        <p class="sub">共 {{ docs.length }} 个文档 · {{ totalChunks }} 个片段{{ isAdmin ? '(管理员:全部部门可见)' : '(仅本部门可见)' }}</p>
       </div>
 
-      <!-- 上传按钮:隐藏原生 input,用美化按钮触发 -->
+    <!-- 上传按钮 + 管理员部门选择:隐藏原生 input,用美化按钮触发 -->
+    <div class="upload-area">
+      <select v-if="isAdmin" v-model="targetDept" class="dept-select" title="目标部门">
+        <option v-for="d in departments" :key="d" :value="d">{{ d }}</option>
+      </select>
       <label class="upload-btn">
         {{ uploading ? '上传中...' : '⬆ 上传文档' }}
         <input type="file" multiple accept=".txt,.md,.pdf,.docx" hidden @change="onUpload" />
       </label>
+    </div>
     </div>
 
     <p v-if="msg" class="msg" :class="msgType">{{ msg }}</p>
@@ -83,9 +103,12 @@ onMounted(loadDocs)
         <div class="doc-icon">📄</div>
         <div class="doc-info">
           <div class="doc-name" :title="d.name">{{ d.name }}</div>
-          <div class="doc-meta">{{ d.chunk_count }} 个片段</div>
+          <div class="doc-meta">
+            <span v-if="isAdmin && d.department" class="mini-dept">{{ d.department }}</span>
+            {{ d.chunk_count }} 个片段
+          </div>
         </div>
-        <button class="del-btn" @click="removeDoc(d.name)">删除</button>
+        <button class="del-btn" @click="removeDoc(d)">删除</button>
       </div>
     </div>
   </div>
@@ -96,6 +119,15 @@ onMounted(loadDocs)
 .head {
   display: flex; justify-content: space-between; align-items: center;
   margin-bottom: 20px;
+}
+.upload-area { display: flex; align-items: center; gap: 8px; }
+.dept-select {
+  padding: 9px 12px; border: 1px solid #e2e8f0; border-radius: 10px;
+  font-size: 13.5px; background: #fff; color: #334155; outline: none;
+}
+.mini-dept {
+  display: inline-block; background: #e0e7ff; color: #4338ca;
+  padding: 1px 8px; border-radius: 999px; font-size: 11px; margin-right: 6px;
 }
 h2 { margin: 0; font-size: 20px; color: #1e293b; }
 .sub { margin: 4px 0 0; font-size: 13px; color: #64748b; }

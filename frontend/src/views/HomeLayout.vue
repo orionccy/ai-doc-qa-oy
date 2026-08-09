@@ -27,7 +27,7 @@ function logout() {
     <header class="topbar">
       <div class="brand">📄 AI 文档问答</div>
       <div class="right">
-        <span class="dept-badge">{{ userStore.user?.department }}</span>
+        <span class="dept-badge">{{ userStore.user?.role === 'admin' ? '全局' : userStore.user?.department }}</span>
         <span class="username">{{ userStore.user?.username }}</span>
         <span v-if="userStore.user?.role === 'admin'" class="admin-badge">管理员</span>
         <button class="logout" @click="logout">退出</button>
